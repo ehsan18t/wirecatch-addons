@@ -1,0 +1,85 @@
+# Copies BtbN's newest FFmpeg 9.0 LGPL shared builds for Windows and Linux x64 into a release of
+# this repository, unchanged and checked against BtbN's checksums. BtbN deletes its dated builds
+# after about two weeks; the copies stay, because every Wirecatch version pins one by SHA-256.
+# It stays on the 9.0 branch: the add-on copies its libraries by name, and a new major renames them.
+name: Copy FFmpeg
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: copy-ffmpeg
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE: BtbN/FFmpeg-Builds
+      BUILD: 'n9\.0\.[0-9]+-[0-9]+-g[0-9a-f]+'
+      ASSETS: 'win64-lgpl-shared-9.0.zip linux64-lgpl-shared-9.0.tar.xz'
+    steps:
+      - name: Find BtbN's newest 9.0 build
+        id: find
+        run: |
+          set -euo pipefail
+          tag=$(gh api "repos/$SOURCE/releases?per_page=10" \
+            --jq '[.[] | select(.tag_name | startswith("autobuild-"))][0].tag_name')
+          name=$(gh api "repos/$SOURCE/releases/tags/$tag" \
+            --jq ".assets[].name | select(test(\"^ffmpeg-$BUILD-win64-lgpl-shared-9\\.0\\.zip$\"))")
+          version=$(sed -E 's/^ffmpeg-(.+)-win64-lgpl-shared-9\.0\.zip$/\1/' <<< "$name")
+          if [ -z "$version" ]; then echo "::error::$tag has no 9.0 LGPL shared build"; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "ffmpeg-$version" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "ffmpeg-$version is already copied."
+            echo "copied=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and check the builds
+        if: steps.find.outputs.copied != 'true'
+        env:
+          TAG: ${{ steps.find.outputs.tag }}
+          VERSION: ${{ steps.find.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir builds && cd builds
+          patterns=(-p checksums.sha256)
+          for asset in $ASSETS; do patterns+=(-p "ffmpeg-$VERSION-$asset"); done
+          gh release download "$TAG" -R "$SOURCE" "${patterns[@]}"
+          for asset in $ASSETS; do
+            grep -E "  ffmpeg-$VERSION-${asset//./\.}$" checksums.sha256
+          done > wanted.sha256
+          [ "$(wc -l < wanted.sha256)" -eq 2 ] || { echo "::error::checksums.sha256 lacks a build"; exit 1; }
+          sha256sum --check --strict wanted.sha256
+
+      - name: Publish the copy
+        if: steps.find.outputs.copied != 'true'
+        env:
+          TAG: ${{ steps.find.outputs.tag }}
+          VERSION: ${{ steps.find.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd builds
+          commit=$(sed -E 's/.*-g([0-9a-f]+)$/\1/' <<< "$VERSION")
+          {
+            echo "FFmpeg $VERSION, the LGPL shared builds for Windows x64 and Linux x64, copied unchanged from BtbN's build [$TAG](https://github.com/$SOURCE/releases/tag/$TAG)."
+            echo
+            echo "Source: FFmpeg commit [$commit](https://github.com/FFmpeg/FFmpeg/commit/$commit) on the 9.0 branch, under the [LGPL 2.1 or later](https://ffmpeg.org/legal.html); the build scripts are [$SOURCE](https://github.com/$SOURCE)."
+            echo
+            echo 'SHA-256:'
+            echo
+            echo '```'
+            cat wanted.sha256
+            echo '```'
+          } > notes.md
+          files=()
+          for asset in $ASSETS; do files+=("ffmpeg-$VERSION-$asset"); done
+          gh release create "ffmpeg-$VERSION" -R "$GITHUB_REPOSITORY" \
+            --title "FFmpeg $VERSION" --notes-file notes.md "${files[@]}"
